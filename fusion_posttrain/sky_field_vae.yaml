@@ -35,7 +35,9 @@ envs:
   REPO_BRANCH: fusion-posttrain
   BUCKET: gs://zen_ml_data/GORGON/DD_IFE_native
   DATA: /data/gorgon
-  OUT: /ckpts/field_vae_pilot
+  OUT_BASE: /ckpts/field_vae_pilot
+  EPOCHS: "40"               # override at launch: --env EPOCHS=10 (test run)
+  RUN_TAG: ""                # override: --env RUN_TAG=-test10 -> isolated dir + W&B run
 
 # SkyPilot `secrets:` -- redacted in logs/dashboard, NEVER committed with values.
 # Left EMPTY here; injected at launch from your shell env (see header).
@@ -68,6 +70,9 @@ run: |
   source ~/miniconda3/etc/profile.d/conda.sh
   conda activate fieldvae
   cd ~/repo/fusion_posttrain
+  OUT=${OUT_BASE}${RUN_TAG}
+  WB_NAME=field-vae-pilot${RUN_TAG}
+  echo "OUT=${OUT} EPOCHS=${EPOCHS} WB=${WB_NAME}"
   mkdir -p ${DATA}/train ${DATA}/valid ${OUT}
 
   echo "=== download 50 train + 8 valid subset (idempotent) ==="
@@ -80,10 +85,10 @@ run: |
   torchrun --nproc_per_node=4 train_field_vae.py \
     --train_dir ${DATA}/train --valid_dir ${DATA}/valid \
     --ids_file refs/subset_train50.txt --valid_ids_file refs/valid8.txt \
-    --epochs 40 --lr 2e-4 --grad_weight 1.0 --kl_weight 1e-6 \
+    --epochs ${EPOCHS} --lr 2e-4 --grad_weight 1.0 --kl_weight 1e-6 \
     --batch_size 1 --num_workers 6 --eval_every 2 --ckpt_artifact_every 10 \
     --out_dir ${OUT} \
-    --wandb field-vae-pilot --wandb_run field-vae-pilot --wandb_id field-vae-pilot-01
+    --wandb field-vae-pilot --wandb_run ${WB_NAME} --wandb_id ${WB_NAME}-01
 
   echo "=== eval + recon PNGs (-> ${OUT}/recon, persisted to bucket) ==="
   python eval_recon.py --ckpt ${OUT}/field_vae_last.pt \
