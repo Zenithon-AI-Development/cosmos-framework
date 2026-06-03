@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: OpenMDW-1.1
+# Stage-1 field-VAE pilot -- 4x A100 (40GB) SPOT via SkyPilot MANAGED jobs.
+#
+# SECRETS: declared in the `secrets:` block below as EMPTY placeholders and injected
+# at launch from your shell env via --secret (values are redacted in SkyPilot logs
+# and never stored in this file / git):
+#
+#   export WANDB_API_KEY=<your-wandb-key>    # W&B logging + model artifacts
+#   export GIT_TOKEN=<your-github-pat>       # clone the PRIVATE Zenithon fork
+#   sky jobs launch -n field-vae-pilot sky_field_vae.yaml \
+#       --secret WANDB_API_KEY --secret GIT_TOKEN
+#
+# SPOT-PREEMPTION RECOVERY (end to end):
+#   * code is git-cloned from the fork each (re)launch -> reproducible source
+#   * checkpoints -> MOUNTED gs://zen_ml_checkpoints (survive instance loss)
+#   * train auto-resumes from /ckpts/field_vae_pilot/field_vae_last.pt
+#     (model+optimizer+epoch+gstep); if that bucket is empty it falls back to the
+#     latest W&B model artifact. Same W&B run continues (fixed id + resume=allow).
+
+name: field-vae-pilot
+
+resources:
+  accelerators: A100:4        # regular A100 = 40GB; up to 4 available
+  use_spot: true              # managed job -> auto-recovers on preemption
+  cloud: gcp
+  disk_size: 256              # ~57GB subset on ephemeral disk + headroom
+
+file_mounts:
+  /ckpts:                     # MOUNT => writes persist in GCS across preemptions
+    source: gs://zen_ml_checkpoints
+    mode: MOUNT
+
+envs:
+  REPO_URL: github.com/Zenithon-AI-Development/cosmos-framework.git
+  REPO_BRANCH: fusion-posttrain
+  BUCKET: gs://zen_ml_data/GORGON/DD_IFE_native
+  DATA: /data/gorgon
+  OUT: /ckpts/field_vae_pilot
+
+# SkyPilot `secrets:` -- redacted in logs/dashboard, NEVER committed with values.
+# Left EMPTY here; injected at launch from your shell env (see header).
+secrets:
+  WANDB_API_KEY: ""           # W&B logging + model artifacts
+  GIT_TOKEN: ""               # clone the private Zenithon fork
+
+setup: |
+  set -e
+  # clone (or refresh) the private fork using the GIT_TOKEN secret
+  if [ ! -d ~/repo/.git ]; then
+    git clone --branch ${REPO_BRANCH} \
+      https://x-access-token:${GIT_TOKEN}@${REPO_URL} ~/repo
+  else
+    git -C ~/repo fetch origin ${REPO_BRANCH} && git -C ~/repo reset --hard origin/${REPO_BRANCH}
+  fi
+  source ~/miniconda3/etc/profile.d/conda.sh
+  conda env list | grep -q '^fieldvae ' || conda create -y -n fieldvae python=3.11
+  conda activate fieldvae
+  python - <<'PYCHK' 2>/dev/null && SKIP=1 || SKIP=0
+  import torch, zarr, wandb, matplotlib, gcsfs, yaml, numpy
+  PYCHK
+  if [ "$SKIP" != "1" ]; then
+    pip install --quiet "torch" "zarr>=3.0" "numpy" "pyyaml" "matplotlib" "gcsfs" "wandb"
+  fi
+  python -c "import torch,zarr;print('deps ok cuda',torch.cuda.is_available(),'zarr',zarr.__version__)"
+
+run: |
+  set -e
+  source ~/miniconda3/etc/profile.d/conda.sh
+  conda activate fieldvae
+  cd ~/repo/fusion_posttrain
+  mkdir -p ${DATA}/train ${DATA}/valid ${OUT}
+
+  echo "=== download 50 train + 8 valid subset (idempotent) ==="
+  while read id; do [ -d "${DATA}/train/${id}.zarr" ] || gsutil -m cp -r "${BUCKET}/data/train/${id}.zarr" "${DATA}/train/"; done < refs/subset_train50.txt
+  while read id; do [ -d "${DATA}/valid/${id}.zarr" ] || gsutil -m cp -r "${BUCKET}/data/valid/${id}.zarr" "${DATA}/valid/"; done < refs/valid8.txt
+  echo "train stores=$(ls ${DATA}/train|wc -l) valid stores=$(ls ${DATA}/valid|wc -l)"
+
+  echo "=== train: 4xA100 DDP, bf16, grad-checkpoint, batch=1/GPU, full-res ==="
+  echo "    (auto-resumes from ${OUT}/field_vae_last.pt if a prior attempt was preempted)"
+  torchrun --nproc_per_node=4 train_field_vae.py \
+    --train_dir ${DATA}/train --valid_dir ${DATA}/valid \
+    --ids_file refs/subset_train50.txt --valid_ids_file refs/valid8.txt \
+    --epochs 40 --lr 2e-4 --grad_weight 1.0 --kl_weight 1e-6 \
+    --batch_size 1 --num_workers 6 --eval_every 2 --ckpt_artifact_every 10 \
+    --out_dir ${OUT} \
+    --wandb field-vae-pilot --wandb_run field-vae-pilot --wandb_id field-vae-pilot-01
+
+  echo "=== eval + recon PNGs (-> ${OUT}/recon, persisted to bucket) ==="
+  python eval_recon.py --ckpt ${OUT}/field_vae_last.pt \
+    --valid_dir ${DATA}/valid --valid_ids_file refs/valid8.txt \
+    --n_traj 4 --out_dir ${OUT}/recon
+  echo DONE
