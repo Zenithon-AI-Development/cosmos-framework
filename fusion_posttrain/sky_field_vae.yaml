@@ -34,7 +34,6 @@ envs:
   REPO_URL: github.com/Zenithon-AI-Development/cosmos-framework.git
   REPO_BRANCH: fusion-posttrain
   BUCKET: gs://zen_ml_data/GORGON/DD_IFE_native
-  DATA: /data/gorgon
   OUT_BASE: /ckpts/field_vae_pilot
   EPOCHS: "40"               # override at launch: --env EPOCHS=10 (test run)
   RUN_TAG: ""                # override: --env RUN_TAG=-test10 -> isolated dir + W&B run
@@ -61,19 +60,26 @@ setup: |
   import torch, zarr, wandb, matplotlib, gcsfs, yaml, numpy
   PYCHK
   if [ "$SKIP" != "1" ]; then
-    pip install --quiet "torch" "zarr>=3.0" "numpy" "pyyaml" "matplotlib" "gcsfs" "wandb"
+    # cu124 wheel: compatible with the GCP A100 node driver (cu130 was too new -> cuda False)
+    pip install --quiet "torch" --index-url https://download.pytorch.org/whl/cu124
+    pip install --quiet "zarr>=3.0" "numpy" "pyyaml" "matplotlib" "gcsfs" "wandb"
   fi
-  python -c "import torch,zarr;print('deps ok cuda',torch.cuda.is_available(),'zarr',zarr.__version__)"
+  python -c "import torch,zarr;print('deps ok torch',torch.__version__,'zarr',zarr.__version__)"
 
 run: |
   set -e
   source ~/miniconda3/etc/profile.d/conda.sh
   conda activate fieldvae
   cd ~/repo/fusion_posttrain
+  DATA=${HOME}/gorgon_data            # boot-disk path the job user can write
   OUT=${OUT_BASE}${RUN_TAG}
   WB_NAME=field-vae-pilot${RUN_TAG}
-  echo "OUT=${OUT} EPOCHS=${EPOCHS} WB=${WB_NAME}"
+  echo "OUT=${OUT} EPOCHS=${EPOCHS} WB=${WB_NAME} DATA=${DATA}"
   mkdir -p ${DATA}/train ${DATA}/valid ${OUT}
+
+  echo "=== GPU sanity (fail fast if driver/torch mismatch) ==="
+  nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+  python -c "import torch;assert torch.cuda.is_available(),'CUDA NOT AVAILABLE';print('cuda ok, gpus',torch.cuda.device_count())"
 
   echo "=== download 50 train + 8 valid subset (idempotent) ==="
   while read id; do [ -d "${DATA}/train/${id}.zarr" ] || gsutil -m cp -r "${BUCKET}/data/train/${id}.zarr" "${DATA}/train/"; done < refs/subset_train50.txt
